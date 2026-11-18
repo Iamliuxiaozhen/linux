@@ -1,0 +1,53 @@
+name: Kernel build test
+
+on:
+  pull_request:
+    branches: [oliver-tree, master]
+  push:
+    branches: [oliver-tree]
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'Kernel config target (defconfig / allmodconfig, etc.)'
+        required: false
+        default: 'defconfig'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      KBUILD_BUILD_USER: ci
+      KBUILD_BUILD_HOST: github-actions
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev rsync cpio kmod xz-utils zstd dwarves
+
+      - name: Generate config and build the full kernel
+        shell: bash
+        run: |
+          set -eo pipefail
+          config="${{ inputs.config || 'defconfig' }}"
+          echo "Using config target: $config"
+          make -j"$(nproc)" "$config" 2>&1 | tee build.log
+          make -j"$(nproc)" 2>&1 | tee -a build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log
+          path: build.log
+          if-no-files-found: ignore

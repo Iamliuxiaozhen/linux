@@ -1,0 +1,105 @@
+name: Release (build .deb / .rpm)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v7.2-oliver1'
+        required: true
+        type: string
+      ref:
+        description: 'Branch / tag / commit to build (leave empty to use the current branch)'
+        required: false
+        default: ''
+        type: string
+      config:
+        description: 'Kernel config target'
+        required: false
+        default: 'defconfig'
+        type: string
+      draft:
+        description: 'Create the release as a draft'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      KBUILD_BUILD_USER: builder
+      KBUILD_BUILD_HOST: github-actions
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev rsync cpio kmod xz-utils zstd dwarves \
+            dpkg-dev debhelper fakeroot rpm
+
+      - name: Generate kernel config
+        shell: bash
+        run: |
+          config="${{ inputs.config || 'defconfig' }}"
+          echo "Using config target: $config"
+          make -j"$(nproc)" "$config"
+
+      - name: Pre-build kernel and modules
+        run: make -j"$(nproc)"
+
+      - name: Build DEB packages
+        run: make -j"$(nproc)" bindeb-pkg
+
+      - name: Build RPM packages
+        run: make -j"$(nproc)" binrpm-pkg
+
+      - name: Collect packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packages"
+          find "$(dirname "$GITHUB_WORKSPACE")" -maxdepth 1 -type f -name '*.deb' \
+            -exec mv -t "$RUNNER_TEMP/packages" {} +
+          find "$GITHUB_WORKSPACE/rpmbuild" -type f -name '*.rpm' \
+            -exec mv -t "$RUNNER_TEMP/packages" {} +
+
+          deb_count="$(find "$RUNNER_TEMP/packages" -name '*.deb' | wc -l)"
+          rpm_count="$(find "$RUNNER_TEMP/packages" -name '*.rpm' | wc -l)"
+          if [[ "$deb_count" -eq 0 || "$rpm_count" -eq 0 ]]; then
+            echo "::error::Incomplete packages: deb=$deb_count, rpm=$rpm_count" >&2
+            exit 1
+          fi
+          echo "Built $deb_count .deb and $rpm_count .rpm packages"
+          ls -lh "$RUNNER_TEMP/packages"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-packages
+          path: ${{ runner.temp }}/packages/*
+          if-no-files-found: error
+
+      - name: Create release (draft by default)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ github.event_name == 'push' || inputs.draft }}
+          generate_release_notes: true
+          files: ${{ runner.temp }}/packages/*
+          fail_on_unmatched_files: true
