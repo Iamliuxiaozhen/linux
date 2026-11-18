@@ -25,24 +25,83 @@ on:
         default: true
         type: boolean
 
-permissions:
-  contents: write
+# A tag may be triggered by both push and workflow_dispatch; use one group to
+# serialize them. cancel-in-progress: false keeps the in-flight run alive.
+# On push, github.ref_name is the tag name; on dispatch, inputs.tag is used.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# No workflow-level contents: write; each job gets minimum permissions instead.
 
 jobs:
-  release:
-    name: Build and release
+  # ======================================================================
+  #  job 1/3: DEB build (also the sole ccache saver and source of BUILD_SHA)
+  # ======================================================================
+  build-deb:
+    name: Build .deb
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      # Pass the commit that was actually checked out to the release job,
+      # instead of github.sha (they differ when dispatch sets inputs.ref).
+      build-sha: ${{ steps.src.outputs.sha }}
     env:
       KBUILD_BUILD_USER: builder
       KBUILD_BUILD_HOST: github-actions
+      # DEBEMAIL from upstream #6: silence the dpkg-buildpackage maintainer warning
       DEBEMAIL: builder@users.noreply.github.com
+
+      # Shared ccache env (both build jobs must match exactly to share the cache).
+      # CCACHE_DIR is set via $GITHUB_ENV in the "Resolve commit" step,
+      # because the runner context is not allowed in job-level env.
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_COMPILERCHECK: content
+      # Critical: a fixed timestamp, otherwise utsversion.h changes every time
+      # and ccache misses 100%.
+      KBUILD_BUILD_TIMESTAMP: ''
+
+      # CC/HOSTCC use '=' assignment in the Makefile, so setting env alone has
+      # no effect; this is the single source of truth for the command line.
+      BUILD_CC: ccache gcc
+      CONFIG: ${{ inputs.config || 'defconfig' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # setlocalversion needs full tag history to detect annotated tags.
           fetch-depth: 0
+
+      - name: Resolve commit SHA and parallelism
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # nproc gcc processes can easily OOM under allyesconfig/allmodconfig.
+          n="$(nproc)"; cap=8
+          j=$(( n < cap ? n : cap )); (( j < 1 )) && j=1
+          # Write MAKEFLAGS once to GITHUB_ENV so all downstream make calls
+          # inherit it, removing the four repeated -j"$(nproc)" occurrences.
+          echo "MAKEFLAGS=-j${j}" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${RUNNER_TEMP}/ccache" >> "$GITHUB_ENV"
+          echo "Parallelism -j${j} (nproc=${n}, cap=${cap})"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          # Exact key includes the git SHA so each commit stores a new key;
+          # the restore-keys prefix allows reuse across commits/workflows.
+          key: ccache-${{ runner.os }}-${{ steps.src.outputs.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
 
       - name: Install build and packaging dependencies
         run: |
@@ -51,57 +110,192 @@ jobs:
             build-essential bc bison flex libssl-dev libelf-dev \
             libncurses-dev rsync cpio kmod xz-utils zstd dwarves \
             libdw-dev python3 \
-            dpkg-dev debhelper fakeroot rpm
+            dpkg-dev debhelper fakeroot rpm ccache
 
       - name: Generate kernel config
-        shell: bash
-        run: |
-          config="${{ inputs.config || 'defconfig' }}"
-          echo "Using config target: $config"
-          make -j"$(nproc)" "$config"
+        run: make "$CONFIG" CC="$BUILD_CC" HOSTCC="$BUILD_CC"
 
       - name: Pre-build kernel and modules
-        run: make -j"$(nproc)"
+        # MAKEFLAGS already carries -j; ccache mainly hits in this step.
+        run: make CC="$BUILD_CC" HOSTCC="$BUILD_CC"
 
       - name: Build DEB packages
-        run: make -j"$(nproc)" bindeb-pkg
+        run: make CC="$BUILD_CC" HOSTCC="$BUILD_CC" bindeb-pkg
 
-      - name: Build RPM packages
-        run: make -j"$(nproc)" binrpm-pkg
-
-      - name: Collect packages
+      - name: Collect DEB packages
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/packages"
+          # dpkg-buildpackage writes .deb files to the objtree's parent dir;
+          # in a standalone job the checkout is still at $GITHUB_WORKSPACE.
           find "$(dirname "$GITHUB_WORKSPACE")" -maxdepth 1 -type f -name '*.deb' \
             -exec mv -t "$RUNNER_TEMP/packages" {} +
-          find "$GITHUB_WORKSPACE/rpmbuild" -type f -name '*.rpm' \
-            -exec mv -t "$RUNNER_TEMP/packages" {} +
-
-          deb_count="$(find "$RUNNER_TEMP/packages" -name '*.deb' | wc -l)"
-          rpm_count="$(find "$RUNNER_TEMP/packages" -name '*.rpm' | wc -l)"
-          if [[ "$deb_count" -eq 0 || "$rpm_count" -eq 0 ]]; then
-            echo "::error::Incomplete packages: deb=$deb_count, rpm=$rpm_count" >&2
-            exit 1
-          fi
-          echo "Built $deb_count .deb and $rpm_count .rpm packages"
+          count="$(find "$RUNNER_TEMP/packages" -name '*.deb' | wc -l)"
+          (( count > 0 )) || { echo "::error::no .deb produced" >&2; exit 1; }
+          echo "Built $count .deb packages"
           ls -lh "$RUNNER_TEMP/packages"
 
-      - name: Upload build artifacts
+      - name: Upload DEB artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-packages
+          # v4 requires a unique artifact name per job
+          name: kernel-deb
           path: ${{ runner.temp }}/packages/*
           if-no-files-found: error
+          retention-days: 7
 
-      - name: Create release (draft by default)
+  # ======================================================================
+  #  job 2/3: RPM build (ccache restore-only, no save race with build-deb)
+  # ======================================================================
+  build-rpm:
+    name: Build .rpm
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      KBUILD_BUILD_USER: builder
+      KBUILD_BUILD_HOST: github-actions
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_COMPILERCHECK: content
+      KBUILD_BUILD_TIMESTAMP: ''
+      BUILD_CC: ccache gcc
+      CONFIG: ${{ inputs.config || 'defconfig' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve commit SHA and parallelism
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          n="$(nproc)"; cap=8
+          j=$(( n < cap ? n : cap )); (( j < 1 )) && j=1
+          echo "MAKEFLAGS=-j${j}" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${RUNNER_TEMP}/ccache" >> "$GITHUB_ENV"
+          echo "Parallelism -j${j} (nproc=${n}, cap=${cap})"
+
+      - name: Restore ccache
+        # Restore-only: build-deb is the saver, avoiding duplicate-save warnings.
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ steps.src.outputs.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev rsync cpio kmod xz-utils zstd dwarves \
+            libdw-dev python3 \
+            dpkg-dev debhelper fakeroot rpm ccache
+
+      - name: Generate kernel config
+        run: make "$CONFIG" CC="$BUILD_CC" HOSTCC="$BUILD_CC"
+
+      - name: Pre-build kernel and modules
+        run: make CC="$BUILD_CC" HOSTCC="$BUILD_CC"
+
+      - name: Build RPM packages
+        run: make CC="$BUILD_CC" HOSTCC="$BUILD_CC" binrpm-pkg
+
+      - name: Collect RPM packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packages"
+          find "$GITHUB_WORKSPACE/rpmbuild" -type f -name '*.rpm' \
+            -exec mv -t "$RUNNER_TEMP/packages" {} +
+          count="$(find "$RUNNER_TEMP/packages" -name '*.rpm' | wc -l)"
+          (( count > 0 )) || { echo "::error::no .rpm produced" >&2; exit 1; }
+          echo "Built $count .rpm packages"
+          ls -lh "$RUNNER_TEMP/packages"
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-rpm
+          path: ${{ runner.temp }}/packages/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ======================================================================
+  #  job 3/3: aggregate and create the release (no checkout / no build)
+  # ======================================================================
+  release:
+    name: Create release
+    needs: [build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Use the commit actually checked out by build-deb, not github.sha.
+      BUILD_SHA: ${{ needs.build-deb.outputs.build-sha }}
+      EVENT_NAME: ${{ github.event_name }}
+      REF_NAME: ${{ github.ref_name }}
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_DRAFT: ${{ inputs.draft }}
+    steps:
+      - name: Compute release parameters (tag / draft)
+        # Semantics are identical to the original expression, just spelled out:
+        #   tag push       -> force draft
+        #   workflow_dispatch -> follow inputs.draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            echo "RELEASE_TAG=$REF_NAME" >> "$GITHUB_ENV"
+            echo "DRAFT=true" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=$INPUT_TAG" >> "$GITHUB_ENV"
+            echo "DRAFT=$INPUT_DRAFT" >> "$GITHUB_ENV"
+          fi
+          # Defensive check: a missing BUILD_SHA would attach the release to the wrong commit.
+          if [[ -z "${BUILD_SHA:-}" ]]; then
+            echo "::error::BUILD_SHA is empty" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG draft=$DRAFT commit=$BUILD_SHA"
+
+      - name: Download and merge packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kernel-*     # matches both kernel-deb and kernel-rpm
+          merge-multiple: true  # .deb and .rpm have different extensions, no collision
+          path: ${{ runner.temp }}/packages
+
+      - name: Verify packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find "$RUNNER_TEMP/packages" -name '*.deb' | wc -l)"
+          rpm="$(find "$RUNNER_TEMP/packages" -name '*.rpm' | wc -l)"
+          (( deb > 0 && rpm > 0 )) || {
+            echo "::error::incomplete artifacts deb=$deb rpm=$rpm" >&2; exit 1; }
+          echo "Publishing $deb .deb and $rpm .rpm"
+          ls -lh "$RUNNER_TEMP/packages"
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          draft: ${{ github.event_name == 'push' || inputs.draft }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          # GitHub ignores this field when the tag already exists; on dispatch
+          # with a new tag it decides where the tag points.
+          target_commitish: ${{ env.BUILD_SHA }}
+          # push -> true (force draft); dispatch -> inputs.draft
+          draft: ${{ env.DRAFT }}
           generate_release_notes: true
           files: ${{ runner.temp }}/packages/*
           fail_on_unmatched_files: true
