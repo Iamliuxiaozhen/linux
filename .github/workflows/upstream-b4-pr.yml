@@ -1,11 +1,17 @@
-name: Sync upstream patches (b4) and open a PR
+name: Sync upstream patches and open a PR
 
 on:
   workflow_dispatch:
     inputs:
       series:
-        description: 'Patch series, one per line: Message-ID, lore URL, or a line with b4 am arguments'
-        required: true
+        description: 'Optional: patch series, one per line (Message-ID, lore URL, or b4 am arguments). Leave empty to sync recent commits from upstream/master.'
+        required: false
+        default: ''
+        type: string
+      max_commits:
+        description: 'Max number of upstream commits to sync when series is empty'
+        required: false
+        default: '20'
         type: string
       base:
         description: 'PR base branch (Oliver tree)'
@@ -23,7 +29,7 @@ on:
         default: true
         type: boolean
       check_upstream:
-        description: 'Also check new commits in upstream/master relative to the base branch'
+        description: 'Report new commits in upstream/master relative to the base branch'
         required: false
         default: true
         type: boolean
@@ -34,7 +40,7 @@ permissions:
 
 jobs:
   sync:
-    name: b4 am -> git am -> PR
+    name: Sync upstream -> PR
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -45,6 +51,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install b4
+        if: inputs.series != ''
         run: |
           # Install in an isolated venv to avoid Ubuntu's
           # externally-managed-environment restriction.
@@ -57,14 +64,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Check upstream updates
-        if: inputs.check_upstream
+      - name: Fetch upstream
+        if: inputs.check_upstream || inputs.series == ''
         shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/torvalds/linux.git 2>/dev/null || \
             git remote set-url upstream https://github.com/torvalds/linux.git
-          git fetch --no-tags --depth=200 upstream master
+          git fetch --no-tags --depth=500 upstream master
           count="$(git rev-list --count HEAD..FETCH_HEAD)"
           {
             echo "### Upstream check"
@@ -79,6 +86,7 @@ jobs:
       - name: Download and apply patches
         env:
           SERIES: ${{ inputs.series }}
+          MAX_COMMITS: ${{ inputs.max_commits }}
           BRANCH_PREFIX: ${{ inputs.branch_prefix }}
           BASE_BRANCH: ${{ inputs.base }}
         shell: bash
@@ -90,47 +98,95 @@ jobs:
 
           patch_dir="$RUNNER_TEMP/b4-patches"
           body="$RUNNER_TEMP/pr-body.md"
+          commit_list="$RUNNER_TEMP/upstream-commits.txt"
           mkdir -p "$patch_dir"
           : > "$body"
+          : > "$commit_list"
 
           {
-            echo "This PR was generated automatically by GitHub Actions: patches were downloaded"
-            echo "from lore.kernel.org with **b4** and applied to a new branch with **git am**."
+            echo "This PR was generated automatically by GitHub Actions."
             echo ""
             echo "Base branch: \`$BASE_BRANCH\`"
             echo ""
-            echo "### Patch series"
-            echo ""
           } >> "$body"
 
-          n=0
-          while IFS= read -r raw || [[ -n "$raw" ]]; do
-            line="${raw#"${raw%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            [[ -z "$line" || "$line" == \#* ]] && continue
-            n=$((n+1))
-            outdir="$patch_dir/series-$n"
-            mkdir -p "$outdir"
-            echo ">>> b4 am -3 --no-cover -o $outdir $line"
-            # A line may carry extra b4 am arguments, so word splitting is intentional here.
-            # shellcheck disable=SC2086
-            b4 am -3 --no-cover -o "$outdir" $line
+          series="${SERIES:-}"
+          series="${series#"${series%%[![:space:]]*}"}"
+          series="${series%"${series##*[![:space:]]}"}"
 
-            mapfile -t mbxes < <(find "$outdir" -maxdepth 1 -type f \
-              \( -name '*.mbox' -o -name '*.mbx' \) -print | sort)
-            mbox="${mbxes[0]:-}"
-            if [[ -z "$mbox" ]]; then
-              echo "::error::b4 did not produce an mbox for: $line" >&2
+          if [[ -n "$series" ]]; then
+            echo "Source: b4 / lore.kernel.org"
+            PR_TITLE="b4: Sync upstream patches ($(date -u +%Y-%m-%d))"
+            {
+              echo "Patches were downloaded from lore.kernel.org with **b4** and"
+              echo "applied to a new branch with **git am**."
+              echo ""
+              echo "### Patch series"
+              echo ""
+            } >> "$body"
+
+            n=0
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+              line="${raw#"${raw%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              n=$((n+1))
+              outdir="$patch_dir/series-$n"
+              mkdir -p "$outdir"
+              echo ">>> b4 am -3 --no-cover -o $outdir $line"
+              # A line may carry extra b4 am arguments, so word splitting is intentional here.
+              # shellcheck disable=SC2086
+              b4 am -3 --no-cover -o "$outdir" $line
+
+              mapfile -t mbxes < <(find "$outdir" -maxdepth 1 -type f \
+                \( -name '*.mbox' -o -name '*.mbx' \) -print | sort)
+              mbox="${mbxes[0]:-}"
+              if [[ -z "$mbox" ]]; then
+                echo "::error::b4 did not produce an mbox for: $line" >&2
+                exit 1
+              fi
+              echo ">>> git am -3 $mbox"
+              git am -3 "$mbox"
+              echo "- \`$line\`" >> "$body"
+            done <<< "$series"
+
+            if [[ "$n" -eq 0 ]]; then
+              echo "::error::No valid patch series was provided" >&2
               exit 1
             fi
-            echo ">>> git am -3 $mbox"
-            git am -3 "$mbox"
-            echo "- \`$line\`" >> "$body"
-          done <<< "$SERIES"
+          else
+            echo "Source: upstream/master (torvalds/linux)"
+            PR_TITLE="Sync upstream commits ($(date -u +%Y-%m-%d))"
+            git rev-list --reverse --no-merges --max-count="$MAX_COMMITS" \
+              "$BASE_BRANCH..FETCH_HEAD" > "$commit_list"
+            mapfile -t commits < "$commit_list"
+            count="${#commits[@]}"
+            if [[ "$count" -eq 0 ]]; then
+              echo "No new commits in upstream/master relative to $BASE_BRANCH; nothing to do."
+              echo "skip_pr=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
 
-          if [[ "$n" -eq 0 ]]; then
-            echo "::error::No valid patch series was provided" >&2
-            exit 1
+            outdir="$patch_dir/upstream"
+            mkdir -p "$outdir"
+            : > "$outdir/upstream.mbox"
+            for c in "${commits[@]}"; do
+              git format-patch --stdout -1 "$c" >> "$outdir/upstream.mbox"
+            done
+            echo ">>> git am -3 $outdir/upstream.mbox ($count patches)"
+            git am -3 "$outdir/upstream.mbox"
+
+            {
+              echo "The latest **$count** non-merge commits from \`upstream/master\`"
+              echo "(torvalds/linux on GitHub) were exported with **git format-patch**"
+              echo "and applied with **git am**."
+              echo ""
+              echo "### Patches"
+              echo ""
+            } >> "$body"
+            for c in "${commits[@]}"; do
+              echo "- \`${c:0:12}\` $(git log -1 --format='%s' "$c")" >> "$body"
+            done
           fi
 
           {
@@ -144,11 +200,15 @@ jobs:
             echo "CI will run the DCO sign-off check and a full kernel build automatically."
           } >> "$body"
 
+          echo "PR_TITLE=$PR_TITLE" >> "$GITHUB_ENV"
+
       - name: Push the new branch
+        if: env.skip_pr != 'true'
         shell: bash
         run: git push --set-upstream origin "$BRANCH"
 
       - name: Open a pull request
+        if: env.skip_pr != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_BRANCH: ${{ inputs.base }}
@@ -161,6 +221,6 @@ jobs:
           gh pr create \
             --base "$BASE_BRANCH" \
             --head "$BRANCH" \
-            --title "b4: Sync upstream patches ($(date -u +%Y-%m-%d))" \
+            --title "$PR_TITLE" \
             --body-file "$RUNNER_TEMP/pr-body.md" \
             "${args[@]}"
