@@ -1,0 +1,166 @@
+name: Sync upstream patches (b4) and open a PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      series:
+        description: 'Patch series, one per line: Message-ID, lore URL, or a line with b4 am arguments'
+        required: true
+        type: string
+      base:
+        description: 'PR base branch (Oliver tree)'
+        required: true
+        default: 'oliver-tree'
+        type: string
+      branch_prefix:
+        description: 'Prefix for the new branch'
+        required: false
+        default: 'b4/upstream-'
+        type: string
+      draft:
+        description: 'Open the PR as a draft'
+        required: false
+        default: true
+        type: boolean
+      check_upstream:
+        description: 'Also check new commits in upstream/master relative to the base branch'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: b4 am -> git am -> PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base }}
+          fetch-depth: 0
+
+      - name: Install b4
+        run: |
+          # Install in an isolated venv to avoid Ubuntu's
+          # externally-managed-environment restriction.
+          python3 -m venv "$RUNNER_TEMP/b4venv"
+          "$RUNNER_TEMP/b4venv/bin/pip" install --quiet --upgrade b4
+          echo "$RUNNER_TEMP/b4venv/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Check upstream updates
+        if: inputs.check_upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/torvalds/linux.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/torvalds/linux.git
+          git fetch --no-tags --depth=200 upstream master
+          count="$(git rev-list --count HEAD..FETCH_HEAD)"
+          {
+            echo "### Upstream check"
+            echo "upstream/master has **$count** new commits relative to \`${{ inputs.base }}\`."
+            echo ""
+            echo "Latest 30:"
+            echo '```'
+            git log --oneline HEAD..FETCH_HEAD | head -n 30
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and apply patches
+        env:
+          SERIES: ${{ inputs.series }}
+          BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+          BASE_BRANCH: ${{ inputs.base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${BRANCH_PREFIX}$(date -u +%Y%m%d%H%M%S)"
+          git checkout -b "$branch"
+          echo "BRANCH=$branch" >> "$GITHUB_ENV"
+
+          patch_dir="$RUNNER_TEMP/b4-patches"
+          body="$RUNNER_TEMP/pr-body.md"
+          mkdir -p "$patch_dir"
+          : > "$body"
+
+          {
+            echo "This PR was generated automatically by GitHub Actions: patches were downloaded"
+            echo "from lore.kernel.org with **b4** and applied to a new branch with **git am**."
+            echo ""
+            echo "Base branch: \`$BASE_BRANCH\`"
+            echo ""
+            echo "### Patch series"
+            echo ""
+          } >> "$body"
+
+          n=0
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line="${raw#"${raw%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            n=$((n+1))
+            outdir="$patch_dir/series-$n"
+            mkdir -p "$outdir"
+            echo ">>> b4 am -3 --no-cover -o $outdir $line"
+            # A line may carry extra b4 am arguments, so word splitting is intentional here.
+            # shellcheck disable=SC2086
+            b4 am -3 --no-cover -o "$outdir" $line
+
+            mapfile -t mbxes < <(find "$outdir" -maxdepth 1 -type f \
+              \( -name '*.mbox' -o -name '*.mbx' \) -print | sort)
+            mbox="${mbxes[0]:-}"
+            if [[ -z "$mbox" ]]; then
+              echo "::error::b4 did not produce an mbox for: $line" >&2
+              exit 1
+            fi
+            echo ">>> git am -3 $mbox"
+            git am -3 "$mbox"
+            echo "- \`$line\`" >> "$body"
+          done <<< "$SERIES"
+
+          if [[ "$n" -eq 0 ]]; then
+            echo "::error::No valid patch series was provided" >&2
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "### Commits added on this branch"
+            echo ""
+            echo '```'
+            git log --oneline "$BASE_BRANCH..HEAD"
+            echo '```'
+            echo ""
+            echo "CI will run the DCO sign-off check and a full kernel build automatically."
+          } >> "$body"
+
+      - name: Push the new branch
+        shell: bash
+        run: git push --set-upstream origin "$BRANCH"
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH: ${{ inputs.base }}
+          DRAFT: ${{ inputs.draft }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$DRAFT" == "true" ]]; then args+=(--draft); fi
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH" \
+            --title "b4: Sync upstream patches ($(date -u +%Y-%m-%d))" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
+            "${args[@]}"

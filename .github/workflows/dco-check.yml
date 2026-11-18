@@ -1,0 +1,88 @@
+name: DCO sign-off check
+
+on:
+  pull_request:
+    branches: [oliver-tree, master]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: Verify Signed-off-by
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve commit range
+        id: range
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          zero="0000000000000000000000000000000000000000"
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # checkout uses refs/pull/N/merge, so HEAD^2 is the PR head.
+            # This also works for PRs from forks.
+            if git rev-parse --verify -q HEAD^2 >/dev/null; then
+              head="$(git rev-parse HEAD^2)"
+            else
+              head="$PR_HEAD_SHA"
+            fi
+            base="$PR_BASE_SHA"
+          else
+            head="$PUSH_AFTER"
+            base="$PUSH_BEFORE"
+
+            # Branch deletion: nothing to check.
+            if [[ "$head" == "$zero" ]]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Branch deleted; skipping DCO check."
+              exit 0
+            fi
+
+            # A new branch has an all-zero "before". A force push may also
+            # point to a commit that is no longer reachable. In both cases,
+            # fall back to the merge base with the default branch, or to the
+            # first parent of HEAD.
+            if [[ "$base" == "$zero" ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              base=""
+              if git rev-parse --verify -q "origin/$DEFAULT_BRANCH" >/dev/null; then
+                base="$(git merge-base "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
+              fi
+              if [[ -z "$base" ]] && git cat-file -e "${head}^1^{commit}" 2>/dev/null; then
+                base="${head}^1"
+              fi
+            fi
+          fi
+
+          if [[ -z "$base" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No base commit available; skipping DCO check."
+            exit 0
+          fi
+
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "Checking commits in $base..$head"
+
+      - name: Check DCO on each commit
+        if: steps.range.outputs.skip != 'true'
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        shell: bash
+        run: bash .github/scripts/check-dco.sh "$BASE_SHA" "$HEAD_SHA"
