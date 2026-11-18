@@ -42,7 +42,9 @@ while IFS= read -r sha; do
 
 	author_name="$(git show -s --format='%an' "$sha")"
 	author_email="$(git show -s --format='%ae' "$sha")"
-	git show -s --format='%B' "$sha" | grep -i '^Signed-off-by:' > "$signoffs" || true
+	# Allow leading whitespace before the trailer (e.g. an accidental space
+	# from an editor or commit tool); the author match below still applies.
+	git show -s --format='%B' "$sha" | grep -iE '^[[:space:]]*Signed-off-by:' > "$signoffs" || true
 
 	signed=0
 	while IFS= read -r line; do
