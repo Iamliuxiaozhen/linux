@@ -24,25 +24,59 @@ jobs:
     env:
       KBUILD_BUILD_USER: ci
       KBUILD_BUILD_HOST: github-actions
+
+      # Shared ccache env (matches release.yml exactly to share the cache).
+      # CCACHE_DIR is set via $GITHUB_ENV in the "Resolve commit" step,
+      # because the runner context is not allowed in job-level env.
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_COMPILERCHECK: content
+      KBUILD_BUILD_TIMESTAMP: ''
+      BUILD_CC: ccache gcc
+      CONFIG: ${{ inputs.config || 'defconfig' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Resolve commit SHA and parallelism
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          # On PRs, checkout uses refs/pull/N/merge, so rev-parse HEAD is the
+          # merge commit and serves as the cache key; cross-workflow reuse
+          # relies on the restore-keys prefix.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          n="$(nproc)"; cap=8
+          j=$(( n < cap ? n : cap )); (( j < 1 )) && j=1
+          echo "MAKEFLAGS=-j${j}" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${RUNNER_TEMP}/ccache" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          # key and restore-keys match release.yml exactly
+          key: ccache-${{ runner.os }}-${{ steps.src.outputs.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
-            libncurses-dev rsync cpio kmod xz-utils zstd dwarves
+            libncurses-dev rsync cpio kmod xz-utils zstd dwarves ccache
 
       - name: Generate config and build the full kernel
         shell: bash
         run: |
           set -eo pipefail
-          config="${{ inputs.config || 'defconfig' }}"
-          echo "Using config target: $config"
-          make -j"$(nproc)" "$config" 2>&1 | tee build.log
-          make -j"$(nproc)" 2>&1 | tee -a build.log
+          echo "Using config target: $CONFIG"
+          # MAKEFLAGS already carries -j; pipefail ensures make failures survive the pipe
+          make "$CONFIG" CC="$BUILD_CC" HOSTCC="$BUILD_CC" 2>&1 | tee build.log
+          make CC="$BUILD_CC" HOSTCC="$BUILD_CC" 2>&1 | tee -a build.log
 
       - name: Upload build log on failure
         if: failure()
