@@ -1,0 +1,40 @@
+name: Auto label issues and PRs
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  # pull_request_target keeps a write-capable token, so PRs from forks can be
+  # labelled too. The script never checks out or runs PR code (see below).
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    name: Apply labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Only read trusted config/scripts from the default branch, not from the
+      # PR head. This is what makes pull_request_target safe here.
+      - name: Check out label config
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: |
+            .github/auto-label.json
+            .github/scripts/auto-label.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Auto label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          ITEM_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          CONFIG: .github/auto-label.json
+        shell: bash
+        run: bash .github/scripts/auto-label.sh
