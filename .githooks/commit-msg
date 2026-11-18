@@ -1,0 +1,52 @@
+#!/bin/sh
+# Automatically add a DCO Signed-off-by trailer to every commit message.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Use commit-msg rather than prepare-commit-msg so this also covers
+# `git commit -m`, editor-based commits, amend and merge, without -s.
+
+set -eu
+
+msg_file=$1
+[ -f "$msg_file" ] || exit 0
+
+# Use the author identity resolved by git, so the signer matches the commit
+# author. Honors user.name/user.email and GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL.
+author_ident=$(git var GIT_AUTHOR_IDENT 2>/dev/null) || exit 0
+
+# "A U Thor <author@example.com> 1700000000 +0800" -> "A U Thor <author@example.com>"
+email=${author_ident##*<}
+email=${email%%>*}
+signer=${author_ident% <*}
+signer="$signer <$email>"
+trailer="Signed-off-by: $signer"
+
+# Skip fixup!/squash! intermediate commits; the final rebase commit gets signed.
+if grep -qiE '^(fixup|squash)!' "$msg_file"; then
+    exit 0
+fi
+
+# Already signed (via -s, cherry-pick or rebase)? Leave the message untouched.
+if grep -qiF "$trailer" "$msg_file"; then
+    exit 0
+fi
+
+tmp=$(mktemp "${msg_file}.dco.XXXXXX")
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+# Drop trailing blank lines, then separate the trailer block with one blank line.
+awk -v trailer="$trailer" '
+    { lines[NR] = $0 }
+    END {
+        last = NR
+        while (last > 0 && lines[last] ~ /^[[:space:]]*$/) last--
+        for (i = 1; i <= last; i++) print lines[i]
+        if (last > 0) print ""
+        print trailer
+    }
+' "$msg_file" > "$tmp"
+
+# Keep the original file inode and permissions.
+cat "$tmp" > "$msg_file"
