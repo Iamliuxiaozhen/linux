@@ -1,0 +1,138 @@
+{
+  "_readme": [
+    "Auto-label configuration for issues and pull requests.",
+    "Keyword rules match the item title + body as CASE-INSENSITIVE SUBSTRINGS.",
+    "Path rules match changed file paths with bash globs (* also matches '/').",
+    "Path rules only run for pull requests. Labels are additive; manual labels",
+    "are never removed. Labels that do not exist yet are created automatically",
+    "with the color/description below (set create_missing_labels to false to",
+    "disable that). Recommended labels are all listed in 'labels'."
+  ],
+
+  "settings": {
+    "create_missing_labels": true
+  },
+
+  "labels": {
+    "ThinkPad-P15-Gen1": {
+      "color": "5319e7",
+      "description": "ThinkPad P15 Gen 1 hardware"
+    },
+    "ThinkPad-P50s": {
+      "color": "5319e7",
+      "description": "ThinkPad P50s hardware"
+    },
+    "bug": {
+      "color": "d73a4a",
+      "description": "Something isn't working"
+    },
+    "enhancement": {
+      "color": "a2eeef",
+      "description": "New feature or request"
+    },
+    "documentation": {
+      "color": "0075ca",
+      "description": "Improvements or additions to documentation"
+    },
+    "question": {
+      "color": "d876e3",
+      "description": "Further information is requested"
+    },
+    "triage": {
+      "color": "fbca04",
+      "description": "New issue, awaiting initial review"
+    },
+    "needs-info": {
+      "color": "fedae6",
+      "description": "Waiting for more information from the reporter"
+    },
+    "upstream": {
+      "color": "0e8a16",
+      "description": "Related to upstream kernel / lore patches"
+    },
+    "drivers": {
+      "color": "c5def5",
+      "description": "Changes under drivers/"
+    },
+    "networking": {
+      "color": "c5def5",
+      "description": "Changes under net/ or drivers/net/"
+    },
+    "filesystem": {
+      "color": "c5def5",
+      "description": "Changes under fs/"
+    },
+    "mm": {
+      "color": "c5def5",
+      "description": "Memory management changes under mm/"
+    },
+    "device-tree": {
+      "color": "bfdd4c",
+      "description": "Device tree (*.dts / *.dtsi) changes"
+    },
+    "build-ci": {
+      "color": "fef2c0",
+      "description": "Build system, scripts or GitHub Actions changes"
+    }
+  },
+
+  "defaults": {
+    "issues": ["triage"],
+    "pull_requests": []
+  },
+
+  "keyword_rules": [
+    {
+      "label": "ThinkPad-P15-Gen1",
+      "keywords": ["thinkpad p15", "p15 gen 1", "p15 gen1", "p15g1", "p15-gen1"]
+    },
+    {
+      "label": "ThinkPad-P50s",
+      "keywords": ["thinkpad p50s", "p50s"]
+    },
+    {
+      "label": "bug",
+      "keywords": [
+        "bug report",
+        "regression",
+        "crash",
+        "panic",
+        "kernel oops",
+        "not working",
+        "doesn't work",
+        "does not work",
+        "can't boot",
+        "cannot boot",
+        "wont boot"
+      ]
+    },
+    {
+      "label": "enhancement",
+      "keywords": ["feature request", "add support", "enhancement", "please add"]
+    },
+    {
+      "label": "documentation",
+      "keywords": ["documentation", "docs", "typo", "readme"]
+    },
+    {
+      "label": "question",
+      "keywords": ["question", "how do i", "how to", "need help"]
+    },
+    {
+      "label": "upstream",
+      "keywords": ["upstream", "lore.kernel.org", "lore kernel", "torvalds"]
+    }
+  ],
+
+  "path_rules": [
+    { "label": "drivers", "paths": ["drivers/*"] },
+    { "label": "networking", "paths": ["net/*", "drivers/net/*"] },
+    { "label": "filesystem", "paths": ["fs/*"] },
+    { "label": "mm", "paths": ["mm/*"] },
+    { "label": "device-tree", "paths": ["arch/*/boot/dts/*", "*.dts", "*.dtsi"] },
+    {
+      "label": "build-ci",
+      "paths": ["Makefile", "Kbuild", "Kconfig", "scripts/*", ".github/*", "*.mk"]
+    }
+  ]
+}
