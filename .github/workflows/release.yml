@@ -36,6 +36,7 @@ jobs:
     env:
       KBUILD_BUILD_USER: builder
       KBUILD_BUILD_HOST: github-actions
+      DEBEMAIL: builder@users.noreply.github.com
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -49,6 +50,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             libncurses-dev rsync cpio kmod xz-utils zstd dwarves \
+            libdw-dev python3 \
             dpkg-dev debhelper fakeroot rpm
 
       - name: Generate kernel config
